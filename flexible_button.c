@@ -50,6 +50,7 @@
 */
 #define BTN_IS_PRESSED(i) (g_btn_status_reg & (1 << i))
 
+/**按键阶段定义 */
 enum FLEX_BTN_STAGE
 {
     FLEX_BTN_STAGE_DEFAULT = 0,
@@ -69,6 +70,7 @@ static flex_button_t *btn_head = NULL;
  * 
  * First registered button, the logic level of the button pressed is 
  * at the low bit of g_logic_level.
+ * 按键逻辑电平，每个bit表示1个按键。按注册先后顺序往左移，最后注册用bit0表示
 */
 btn_type_t g_logic_level = (btn_type_t)0;
 
@@ -79,10 +81,11 @@ btn_type_t g_logic_level = (btn_type_t)0;
  * 
  * First registered button, the pressing state of the button is 
  * at the low bit of g_btn_status_reg.
+ * 按键按下状态，每个bit表示1个按键，1表示按下。按注册先后顺序往左移，最后注册用bit0表示
 */
 btn_type_t g_btn_status_reg = (btn_type_t)0;
 
-static uint8_t button_cnt = 0;
+static uint8_t button_cnt = 0;//记录已注册按键数量
 
 /**
  * @brief Register a user button
@@ -94,6 +97,7 @@ int32_t flex_button_register(flex_button_t *button)
 {
     flex_button_t *curr = btn_head;
     
+    //合法性判断，用g_logic_level记录每个按键的逻辑电平，button_cnt不能超过g_logic_level的bit数
     if (!button || (button_cnt > sizeof(btn_type_t) * 8))
     {
         return -1;
@@ -111,6 +115,7 @@ int32_t flex_button_register(flex_button_t *button)
     /**
      * First registered button is at the end of the 'linked list'.
      * btn_head points to the head of the 'linked list'.
+     * 列表头插法，先插入的在list尾部，后插入的在头部btn_head
     */
     button->next = btn_head;
     button->status = FLEX_BTN_STAGE_DEFAULT;
@@ -144,6 +149,7 @@ static void flex_button_read(void)
     /* The button that was registered first, the button value is in the low position of raw_data */
     btn_type_t raw_data = 0;
 
+    //遍历读取所有按键状态
     for(target = btn_head, i = button_cnt - 1;
         (target != NULL) && (target->usr_button_read != NULL);
         target = target->next, i--)
@@ -151,6 +157,9 @@ static void flex_button_read(void)
         raw_data = raw_data | ((target->usr_button_read)(target) << i);
     }
 
+    //异或：相同为0，不同为1
+    //先对raw_data取反，是为了实现相同为1即扫描的状态和逻辑电平相等则视为按键按下。
+    //这里记录状态：按键按下即状态为1
     g_btn_status_reg = (~raw_data) ^ g_logic_level;
 }
 
@@ -159,7 +168,7 @@ static void flex_button_read(void)
  *        Must be used after 'flex_button_read' API
  * 
  * @param void
- * @return Activated button count
+ * @return Activated button count 活跃按键数量
 */
 static uint8_t flex_button_process(void)
 {
@@ -169,9 +178,11 @@ static uint8_t flex_button_process(void)
     
     for (target = btn_head, i = button_cnt - 1; target != NULL; target = target->next, i--)
     {
+        //非默认阶段
         if (target->status > FLEX_BTN_STAGE_DEFAULT)
         {
             target->scan_cnt ++;
+            //判断target->scan_cnt计数值是否达到最大了，即将溢出
             if (target->scan_cnt >= ((1 << (sizeof(target->scan_cnt) * 8)) - 1))
             {
                 target->scan_cnt = target->long_hold_start_tick;
@@ -180,6 +191,7 @@ static uint8_t flex_button_process(void)
 
         switch (target->status)
         {
+            //阶段1：默认（释放）
         case FLEX_BTN_STAGE_DEFAULT: /* stage: default(button up) */
             if (BTN_IS_PRESSED(i)) /* is pressed */
             {
@@ -193,10 +205,14 @@ static uint8_t flex_button_process(void)
             }
             else
             {
-                target->event = FLEX_BTN_PRESS_NONE;
+                if(target->event != FLEX_BTN_PRESS_NONE){
+                    EVENT_SET_AND_EXEC_CB(target, FLEX_BTN_PRESS_RELEASE);
+                    target->event = FLEX_BTN_PRESS_NONE;
+                }
             }
             break;
 
+            //阶段2：按下
         case FLEX_BTN_STAGE_DOWN: /* stage: button down */
             if (BTN_IS_PRESSED(i)) /* is pressed */
             {
@@ -239,19 +255,8 @@ static uint8_t flex_button_process(void)
             }
             else /* button up */
             {
-                if (target->scan_cnt >= target->long_hold_start_tick)
+                if (target->scan_cnt >= target->short_press_start_tick)
                 {
-                    EVENT_SET_AND_EXEC_CB(target, FLEX_BTN_PRESS_LONG_HOLD_UP);
-                    target->status = FLEX_BTN_STAGE_DEFAULT;
-                }
-                else if (target->scan_cnt >= target->long_press_start_tick)
-                {
-                    EVENT_SET_AND_EXEC_CB(target, FLEX_BTN_PRESS_LONG_UP);
-                    target->status = FLEX_BTN_STAGE_DEFAULT;
-                }
-                else if (target->scan_cnt >= target->short_press_start_tick)
-                {
-                    EVENT_SET_AND_EXEC_CB(target, FLEX_BTN_PRESS_SHORT_UP);
                     target->status = FLEX_BTN_STAGE_DEFAULT;
                 }
                 else
@@ -263,6 +268,7 @@ static uint8_t flex_button_process(void)
             }
             break;
 
+            //阶段3：多按
         case FLEX_BTN_STAGE_MULTIPLE_CLICK: /* stage: multiple click */
             if (BTN_IS_PRESSED(i)) /* is pressed */
             {
